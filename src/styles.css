@@ -177,6 +177,21 @@ small,
   margin: 0;
 }
 
+.hero-credit {
+  margin-top: 8px;
+  color: var(--soft);
+  font-size: 0.84rem;
+}
+
+.hero-credit a {
+  color: var(--orange-2);
+  text-decoration: none;
+}
+
+.hero-credit a:hover {
+  text-decoration: underline;
+}
+
 .hero-actions {
   min-width: 300px;
   display: flex;

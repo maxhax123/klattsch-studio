@@ -489,6 +489,10 @@ function renderShell() {
           <p class="hero-text">
             Playlist words, draw automation, and render like a proper vocal sketchpad.
           </p>
+          <p class="hero-credit">
+            Original synthesizer by
+            <a href="https://tgies.github.io/klattsch/" target="_blank" rel="noreferrer">tgies.github.io/klattsch</a>.
+          </p>
           <div id="project-tabs" class="project-tabs"></div>
         </div>
         <div class="hero-actions" id="header-actions"></div>
