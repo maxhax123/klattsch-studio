@@ -389,6 +389,14 @@ small,
     rgba(255, 255, 255, 0.015);
 }
 
+.timeline-transport {
+  margin-top: 10px;
+}
+
+.timeline-transport-row {
+  justify-content: flex-start;
+}
+
 .timeline-grid {
   position: relative;
   background:

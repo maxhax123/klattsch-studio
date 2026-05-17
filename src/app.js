@@ -516,6 +516,7 @@ function renderShell() {
                 <div class="timeline-scroll" id="timeline-scroll">
                   <div class="timeline-grid" id="timeline-grid"></div>
                 </div>
+                <div class="timeline-transport" id="timeline-transport"></div>
               </div>
             </div>
             <div class="automation-section ${sectionClass('keyframes')}">
@@ -669,6 +670,7 @@ function renderHeader() {
   const selected = getSelectedClip();
   const actions = document.getElementById('header-actions');
   const projectTabs = document.getElementById('project-tabs');
+  const timelineTransport = document.getElementById('timeline-transport');
   const activeProjectId = state.workspace.activeProjectId;
   const history = getHistory();
   projectTabs.innerHTML = state.workspace.projects.map((entry) => `
@@ -685,13 +687,8 @@ function renderHeader() {
   actions.innerHTML = `
     <div class="transport-stack">
       <div class="transport-row">
-        <button type="button" class="ghost-btn" data-action="undo" ${history.undo.length ? '' : 'disabled'}>Undo</button>
-        <button type="button" class="ghost-btn" data-action="redo" ${history.redo.length ? '' : 'disabled'}>Redo</button>
-        <button type="button" class="primary-btn" data-action="play">${state.isPlaying ? 'Playing...' : 'Play Arrangement'}</button>
-        <button type="button" class="ghost-btn" data-action="stop">Stop</button>
-      </div>
-      <div class="transport-row">
         <button type="button" class="ghost-btn" data-action="new-project">New Project</button>
+        <button type="button" class="ghost-btn danger" data-action="delete-project">Delete Project</button>
         <button type="button" class="ghost-btn" data-action="export-mp3">Export MP3</button>
         <button type="button" class="ghost-btn" data-action="export-video">Export Video</button>
         <button type="button" class="ghost-btn" data-action="export-song">Save Song</button>
@@ -702,6 +699,16 @@ function renderHeader() {
       </div>
     </div>
   `;
+  if (timelineTransport) {
+    timelineTransport.innerHTML = `
+      <div class="transport-row timeline-transport-row">
+        <button type="button" class="ghost-btn" data-action="undo" ${history.undo.length ? '' : 'disabled'}>Undo</button>
+        <button type="button" class="ghost-btn" data-action="redo" ${history.redo.length ? '' : 'disabled'}>Redo</button>
+        <button type="button" class="primary-btn" data-action="play">${state.isPlaying ? 'Playing...' : 'Play Arrangement'}</button>
+        <button type="button" class="ghost-btn" data-action="stop">Stop</button>
+      </div>
+    `;
+  }
 }
 
 function renderTimeline() {
@@ -1059,6 +1066,34 @@ function createAdditionalProject(seedProject = createProject()) {
   setSelection(entry.project.clips[0] ? [entry.project.clips[0].id] : [], entry.project.clips[0]?.id ?? null);
   persist();
   renderAll();
+}
+
+function deleteCurrentProject() {
+  if (state.workspace.projects.length <= 1) {
+    const onlyProject = state.workspace.projects[0];
+    onlyProject.project = createProject();
+    onlyProject.title = onlyProject.project.master.title || 'Demo Session';
+    state.project = onlyProject.project;
+    setSelection(state.project.clips[0] ? [state.project.clips[0].id] : [], state.project.clips[0]?.id ?? null);
+    persist();
+    renderAll();
+    return 'reset';
+  }
+
+  const activeId = state.workspace.activeProjectId;
+  const index = state.workspace.projects.findIndex((entry) => entry.id === activeId);
+  if (index < 0) return 'missing';
+  delete state.histories[activeId];
+  delete state.projectSelections[activeId];
+  state.workspace.projects.splice(index, 1);
+  const nextEntry = state.workspace.projects[Math.max(0, index - 1)] ?? state.workspace.projects[0];
+  state.workspace.activeProjectId = nextEntry.id;
+  syncActiveProjectReference();
+  restoreSelectionForCurrentProject();
+  ensureSelection();
+  persist();
+  renderAll();
+  return 'deleted';
 }
 
 function switchProject(projectId) {
@@ -1573,6 +1608,15 @@ function wireShellEvents() {
     if (action === 'new-project') {
       createAdditionalProject(createProject());
       setStatus('Opened a fresh project tab.', 'success');
+      return;
+    }
+    if (action === 'delete-project') {
+      const result = deleteCurrentProject();
+      if (result === 'reset') {
+        setStatus('Reset the last remaining project.', 'success');
+      } else if (result === 'deleted') {
+        setStatus('Project deleted.', 'success');
+      }
       return;
     }
     if (action === 'close-modal') {
