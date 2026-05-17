@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "cmu-pronouncing-dictionary": "^3.0.0",
+    "lamejs": "^1.2.1"
+  }
+}

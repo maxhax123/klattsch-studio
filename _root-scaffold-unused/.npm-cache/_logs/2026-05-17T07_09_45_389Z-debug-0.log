@@ -1,0 +1,42 @@
+0 verbose cli C:\Program Files\nodejs\node.exe C:\Users\Maxwell\AppData\Roaming\npm\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.10.1
+2 info using node@v22.15.0
+3 silly config load:file:C:\Users\Maxwell\AppData\Roaming\npm\node_modules\npm\npmrc
+4 silly config load:file:C:\Users\Maxwell\Desktop\klattsch-maker\output\.npmrc
+5 silly config load:file:C:\Users\Maxwell\.npmrc
+6 silly config load:file:C:\Users\Maxwell\Desktop\klattsch-maker\output\etc\npmrc
+7 verbose title npm install cmu-pronouncing-dictionary lamejs
+8 verbose argv "install" "--prefix" "C:\\Users\\Maxwell\\Desktop\\klattsch-maker\\output" "--ignore-scripts" "cmu-pronouncing-dictionary" "lamejs"
+9 verbose logfile logs-max:10 dir:C:\Users\Maxwell\Desktop\klattsch-maker\.npm-cache\_logs\2026-05-17T07_09_45_389Z-
+10 verbose logfile C:\Users\Maxwell\Desktop\klattsch-maker\.npm-cache\_logs\2026-05-17T07_09_45_389Z-debug-0.log
+11 silly logfile done cleaning log files
+12 silly packumentCache heap:4345298944 maxSize:1086324736 maxEntrySize:543162368
+13 silly idealTree buildDeps
+14 silly fetch manifest cmu-pronouncing-dictionary@*
+15 silly packumentCache full:https://registry.npmjs.org/cmu-pronouncing-dictionary cache-miss
+16 http cache https://registry.npmjs.org/cmu-pronouncing-dictionary 15ms (cache hit)
+17 silly packumentCache full:https://registry.npmjs.org/cmu-pronouncing-dictionary set size:17479 disposed:false
+18 silly fetch manifest lamejs@*
+19 silly packumentCache full:https://registry.npmjs.org/lamejs cache-miss
+20 http cache https://registry.npmjs.org/lamejs 8ms (cache hit)
+21 silly packumentCache full:https://registry.npmjs.org/lamejs set size:10534 disposed:false
+22 silly placeDep ROOT cmu-pronouncing-dictionary@3.0.0 OK for:  want: *
+23 silly placeDep ROOT lamejs@1.2.1 OK for:  want: *
+24 silly fetch manifest use-strict@1.0.1
+25 silly packumentCache full:https://registry.npmjs.org/use-strict cache-miss
+26 http cache https://registry.npmjs.org/use-strict 7ms (cache hit)
+27 silly packumentCache full:https://registry.npmjs.org/use-strict set size:4736 disposed:false
+28 silly placeDep ROOT use-strict@1.0.1 OK for: lamejs@1.2.1 want: 1.0.1
+29 silly reify moves {}
+30 http cache use-strict@https://registry.npmjs.org/use-strict/-/use-strict-1.0.1.tgz 0ms (cache hit)
+31 http cache lamejs@https://registry.npmjs.org/lamejs/-/lamejs-1.2.1.tgz 0ms (cache hit)
+32 http cache cmu-pronouncing-dictionary@https://registry.npmjs.org/cmu-pronouncing-dictionary/-/cmu-pronouncing-dictionary-3.0.0.tgz 0ms (cache hit)
+33 silly ADD node_modules/use-strict
+34 silly ADD node_modules/lamejs
+35 silly ADD node_modules/cmu-pronouncing-dictionary
+36 verbose cwd C:\Users\Maxwell\Desktop\klattsch-maker
+37 verbose os Windows_NT 10.0.26200
+38 verbose node v22.15.0
+39 verbose npm  v11.10.1
+40 verbose exit 0
+41 info ok

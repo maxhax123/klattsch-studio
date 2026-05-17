@@ -1,0 +1,18 @@
+0 verbose cli C:\Program Files\nodejs\node.exe C:\Users\Maxwell\AppData\Roaming\npm\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.10.1
+2 info using node@v22.15.0
+3 silly config load:file:C:\Users\Maxwell\AppData\Roaming\npm\node_modules\npm\npmrc
+4 silly config load:file:C:\Users\Maxwell\.npmrc
+5 silly config load:file:C:\Users\Maxwell\AppData\Roaming\npm\etc\npmrc
+6 verbose title npm view @vitejs/plugin-react-swc version
+7 verbose argv "view" "@vitejs/plugin-react-swc" "version"
+8 verbose logfile logs-max:10 dir:C:\Users\Maxwell\Desktop\klattsch-maker\.npm-cache\_logs\2026-05-17T07_06_08_694Z-
+9 verbose logfile C:\Users\Maxwell\Desktop\klattsch-maker\.npm-cache\_logs\2026-05-17T07_06_08_694Z-debug-0.log
+10 silly logfile done cleaning log files
+11 http fetch GET 200 https://registry.npmjs.org/@vitejs%2fplugin-react-swc 168ms (cache miss)
+12 verbose cwd C:\Users\Maxwell\Desktop\klattsch-maker
+13 verbose os Windows_NT 10.0.26200
+14 verbose node v22.15.0
+15 verbose npm  v11.10.1
+16 verbose exit 0
+17 info ok
