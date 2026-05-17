@@ -8,6 +8,8 @@ import {
 import { makeId } from './id.js';
 
 const BASE_LOOKUP = new Map();
+const REVERSE_LOOKUP = new Map();
+const REVERSE_LOOKUP_STRESSLESS = new Map();
 const VOWEL_PHONEMES = new Set([
   'AA', 'AE', 'AH', 'AO', 'AW', 'AY', 'EH', 'ER', 'EY',
   'IH', 'IY', 'OW', 'OY', 'UH', 'UW', 'A', 'E', 'I', 'O', 'U',
@@ -21,11 +23,37 @@ const PUNCTUATION_GAPS = new Map([
   ['?', 1],
 ]);
 
+function normalizeProtocolForLookup(protocol) {
+  return protocol.trim().replace(/\s+/gu, ' ');
+}
+
+function normalizeProtocolStressless(protocol) {
+  return normalizeProtocolForLookup(protocol).replace(/[!']/gu, '');
+}
+
+function scoreReverseCandidate(word) {
+  let score = word.length;
+  if (!/^[a-z]+$/u.test(word)) score += 5;
+  if (word.includes('\'')) score += 3;
+  if (word.endsWith("'s")) score += 2;
+  return score;
+}
+
+function maybeSetReverseLookup(map, key, word) {
+  const existing = map.get(key);
+  if (!existing || scoreReverseCandidate(word) < scoreReverseCandidate(existing)) {
+    map.set(key, word);
+  }
+}
+
 for (const [word, pronunciation] of Object.entries(dictionary)) {
   const base = word.replace(/\(\d+\)$/u, '');
   if (!BASE_LOOKUP.has(base)) {
     BASE_LOOKUP.set(base, pronunciation);
   }
+  const protocol = pronunciationToProtocol(pronunciation);
+  maybeSetReverseLookup(REVERSE_LOOKUP, normalizeProtocolForLookup(protocol), base);
+  maybeSetReverseLookup(REVERSE_LOOKUP_STRESSLESS, normalizeProtocolStressless(protocol), base);
 }
 
 const GREEDY_DIGRAPHS = [
@@ -178,6 +206,32 @@ function fallbackPronunciation(word) {
 export function wordToProtocol(word) {
   const pronunciation = lookupPronunciation(word);
   return pronunciation ? pronunciationToProtocol(pronunciation) : fallbackPronunciation(word);
+}
+
+function prettifyFallbackLabel(protocol) {
+  const parts = protocol
+    .replaceAll('(', ' ')
+    .replaceAll(')', ' ')
+    .split(/\s+/u)
+    .filter(Boolean)
+    .map((part) => part.replace(/[!']/gu, '').replace(/[+-]\d+(?:\.\d+)?$/u, ''))
+    .filter(Boolean);
+
+  if (!parts.length) return 'imported word';
+  return parts
+    .slice(0, 3)
+    .map((part) => part[0] + part.slice(1).toLowerCase())
+    .join('-');
+}
+
+export function protocolToWordLabel(protocol) {
+  const normalized = normalizeProtocolForLookup(protocol);
+  const exact = REVERSE_LOOKUP.get(normalized);
+  const stressless = REVERSE_LOOKUP_STRESSLESS.get(normalizeProtocolStressless(normalized));
+  if (exact && stressless) {
+    return scoreReverseCandidate(stressless) <= scoreReverseCandidate(exact) ? stressless : exact;
+  }
+  return exact ?? stressless ?? prettifyFallbackLabel(normalized);
 }
 
 export function sentenceToClips(sentence, master = DEFAULT_MASTER) {

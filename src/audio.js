@@ -141,9 +141,10 @@ export class StudioAudio {
     };
   }
 
-  async play(project) {
+  async play(project, options = {}) {
     await this.ensureLiveContext(project.master.outputVolume);
     const rendered = await this.renderBuffer(project);
+    const startMs = Math.max(0, Math.min(options.startMs ?? 0, rendered.result.totalMs));
     const buffer = this.ctx.createBuffer(1, rendered.buffer.length, rendered.sampleRate);
     buffer.getChannelData(0).set(rendered.buffer);
     const source = this.ctx.createBufferSource();
@@ -156,12 +157,12 @@ export class StudioAudio {
     };
     this.stop();
     this.currentSource = source;
-    source.start();
+    source.start(0, startMs / 1000);
     this.onStatus?.(renderStatusMessage(rendered.result), rendered.result.warnings.length ? 'warn' : 'info');
 
     const startedAt = this.ctx.currentTime;
     const tick = () => {
-      const currentMs = (this.ctx.currentTime - startedAt) * 1000;
+      const currentMs = startMs + (this.ctx.currentTime - startedAt) * 1000;
       const active =
         rendered.playbackSegments.find((segment) => currentMs >= segment.tStartMs && currentMs < segment.tEndMs)
         ?? null;
@@ -264,8 +265,8 @@ export class StudioAudio {
       context2d.fillStyle = '#0a0d11';
       context2d.fillRect(0, 0, width, height);
       const gradient = context2d.createLinearGradient(0, 0, width, height);
-      gradient.addColorStop(0, 'rgba(255, 127, 39, 0.16)');
-      gradient.addColorStop(1, 'rgba(30, 40, 58, 0.1)');
+      gradient.addColorStop(0, 'rgba(37, 99, 235, 0.18)');
+      gradient.addColorStop(1, 'rgba(15, 23, 42, 0.12)');
       context2d.fillStyle = gradient;
       context2d.fillRect(0, 0, width, height);
 
@@ -304,7 +305,7 @@ export class StudioAudio {
         const x = timelineX + (clip.startBeat / totalBeats) * timelineWidth;
         const w = (clip.lengthBeats / totalBeats) * timelineWidth;
         const y = timelineY + (6 - Math.round(clip.pitchOffset / 2)) * laneHeight;
-        context2d.fillStyle = active?.clipId === clip.id ? '#ff8c42' : '#2dd4bf';
+        context2d.fillStyle = active?.clipId === clip.id ? '#60a5fa' : '#22d3ee';
         context2d.globalAlpha = active?.clipId === clip.id ? 1 : 0.8;
         context2d.fillRect(x, y, w, laneHeight - 4);
         context2d.globalAlpha = 1;
@@ -320,7 +321,7 @@ export class StudioAudio {
       for (let index = 0; index < 36; index += 1) {
         const magnitude = frequencyData[index] / 255;
         const barHeight = 12 + magnitude * 160;
-        context2d.fillStyle = magnitude > 0.75 ? '#f97316' : magnitude > 0.45 ? '#fb7185' : '#38bdf8';
+        context2d.fillStyle = magnitude > 0.75 ? '#60a5fa' : magnitude > 0.45 ? '#38bdf8' : '#22d3ee';
         context2d.fillRect(meterX + index * (barWidth + barGap), meterY + 180 - barHeight, barWidth, barHeight);
       }
 

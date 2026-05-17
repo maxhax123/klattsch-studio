@@ -9,8 +9,9 @@ import {
   PROJECT_STORAGE_KEY,
   SNAP_BEAT,
 } from './constants.js';
-import { sentenceToClips } from './g2p.js';
+import { protocolToWordLabel, sentenceToClips } from './g2p.js';
 import { makeId } from './id.js';
+import { banks } from './engine/banks/index.js';
 import { tokenize } from './engine/sequencer.js';
 
 export function clamp(value, min, max) {
@@ -68,6 +69,66 @@ export function syncClipTiming(project, clip) {
   return clip;
 }
 
+function normalizeExactImport(exactImport) {
+  if (!exactImport || typeof exactImport !== 'object') return null;
+  if (typeof exactImport.body !== 'string' || !exactImport.body.trim()) return null;
+  return {
+    body: exactImport.body.trim(),
+    leadInMs: Number.isFinite(exactImport.leadInMs) ? Math.max(0, Number(exactImport.leadInMs)) : null,
+    anchorStartBeat: Number.isFinite(exactImport.anchorStartBeat) ? Number(exactImport.anchorStartBeat) : 0,
+    audioSignature: typeof exactImport.audioSignature === 'string' ? exactImport.audioSignature : '',
+  };
+}
+
+function stringifyAutomation(points) {
+  return (Array.isArray(points) ? points : [])
+    .map((point) => `${Number(point.time).toFixed(4)}:${Number(point.value).toFixed(4)}`)
+    .join('|');
+}
+
+export function getClipAudioSignature(project, clip) {
+  const masterAudio = {
+    baseF0: Number(project.master.baseF0).toFixed(4),
+    bank: project.master.bank,
+    rate: Number(project.master.rate).toFixed(4),
+    scale: Number(project.master.scale).toFixed(4),
+    vibratoDepth: Number(project.master.vibratoDepth).toFixed(4),
+    vibratoRate: Number(project.master.vibratoRate).toFixed(4),
+    tremoloDepth: Number(project.master.tremoloDepth).toFixed(4),
+    tremoloRate: Number(project.master.tremoloRate).toFixed(4),
+    aspiration: Number(project.master.aspiration).toFixed(4),
+    tilt: Number(project.master.tilt).toFixed(4),
+    effort: Number(project.master.effort).toFixed(4),
+  };
+  const clipAudio = {
+    phonemes: clip.phonemes.trim().replace(/\s+/gu, ' '),
+    bank: clip.bank,
+    rateMs: Number(clip.rateMs).toFixed(4),
+    pitchOffset: Number(clip.pitchOffset).toFixed(4),
+    effects: Object.fromEntries(
+      CLIP_EFFECT_KEYS.map((key) => [key, Number((clip.effects[key] ?? project.master[key])).toFixed(4)]),
+    ),
+    automation: Object.fromEntries(
+      AUTOMATION_PARAM_KEYS.map((key) => [key, stringifyAutomation(clip.automation[key])]),
+    ),
+  };
+  return JSON.stringify({ masterAudio, clipAudio });
+}
+
+function getExactBodyIfCurrent(project, clip) {
+  if (!clip.exactImport?.body) return null;
+  return clip.exactImport.audioSignature === getClipAudioSignature(project, clip)
+    ? clip.exactImport.body
+    : null;
+}
+
+function getExactLeadInIfAnchored(clip) {
+  if (!clip.exactImport || !Number.isFinite(clip.exactImport.leadInMs)) return null;
+  return Math.abs(clip.startBeat - (clip.exactImport.anchorStartBeat ?? clip.startBeat)) < 0.0001
+    ? clip.exactImport.leadInMs
+    : null;
+}
+
 export function normalizeClip(project, clip, colorIndex = 0) {
   const normalized = {
     id: clip.id ?? makeId(),
@@ -81,6 +142,7 @@ export function normalizeClip(project, clip, colorIndex = 0) {
     bank: clip.bank ?? project.master.bank,
     effects: {},
     automation: {},
+    exactImport: normalizeExactImport(clip.exactImport),
   };
 
   for (const key of CLIP_EFFECT_KEYS) {
@@ -192,6 +254,16 @@ function stateToDirectives(state, previousState = null) {
   return tokens;
 }
 
+function buildStandaloneImportBody(state, rawBody) {
+  const prefixTokens = stateToDirectives(state, null);
+  const bodyTokens = rawBody.trim().split(/\s+/u).filter(Boolean);
+  let overlap = 0;
+  while (overlap < prefixTokens.length && overlap < bodyTokens.length && prefixTokens[overlap] === bodyTokens[overlap]) {
+    overlap += 1;
+  }
+  return [...prefixTokens, ...bodyTokens.slice(overlap)].join(' ').trim();
+}
+
 function buildClipEvents(raw) {
   const parsed = tokenize(raw || '');
   const source = parsed.source;
@@ -288,12 +360,13 @@ export function buildProtocol(project) {
   let charCount = `${lines[0]}\n`.length;
 
   for (const clip of clips) {
-    const gapMs = Math.max(0, (clip.startBeat - cursorBeat) * beatMs);
+    const gapMs = getExactLeadInIfAnchored(clip) ?? Math.max(0, (clip.startBeat - cursorBeat) * beatMs);
+    const clipBody = getExactBodyIfCurrent(project, clip) ?? buildClipProtocol(project, clip);
     const chunkParts = [];
     if (gapMs >= 15) {
       chunkParts.push(`p${Math.round(gapMs)}`);
     }
-    chunkParts.push(buildClipProtocol(project, clip));
+    chunkParts.push(clipBody);
     const line = chunkParts.join(' ');
     lines.push(line);
     ranges.push({
@@ -325,6 +398,207 @@ export function duplicateClip(project, clip) {
 function splitTextLabel(text) {
   const midpoint = Math.max(1, Math.floor(text.length / 2));
   return [text.slice(0, midpoint).trim() || `${text} A`, text.slice(midpoint).trim() || `${text} B`];
+}
+
+function looksLikeReadableWord(text) {
+  return /^[a-z][a-z'-]*$/iu.test(text) && !text.includes('-');
+}
+
+export function reconstructSentenceFromClips(clips) {
+  const words = clips
+    .map((clip) => clip.text?.trim())
+    .filter((text) => text && looksLikeReadableWord(text));
+  if (!words.length) return '';
+  const sentence = words.join(' ').replace(/\s+/gu, ' ').trim();
+  return sentence ? sentence[0].toUpperCase() + sentence.slice(1) : '';
+}
+
+const IMPORT_DIRECTIVE_MAP = {
+  rate: 'rate',
+  scale: 'scale',
+  vibrato: 'vibratoDepth',
+  vibratoRate: 'vibratoRate',
+  tremolo: 'tremoloDepth',
+  tremoloRate: 'tremoloRate',
+  aspiration: 'aspiration',
+  tilt: 'tilt',
+  effort: 'effort',
+};
+
+function getImportInitialState(project) {
+  return {
+    bank: project.master.bank,
+    baseF0Hz: project.master.baseF0,
+    rate: project.master.rate,
+    scale: project.master.scale,
+    vibratoDepth: project.master.vibratoDepth,
+    vibratoRate: project.master.vibratoRate,
+    tremoloDepth: project.master.tremoloDepth,
+    tremoloRate: project.master.tremoloRate,
+    aspiration: project.master.aspiration,
+    tilt: project.master.tilt,
+    effort: project.master.effort,
+  };
+}
+
+function cloneImportState(state) {
+  return { ...state };
+}
+
+function applyDirectiveToImportState(state, token, initialState) {
+  if (token.type === 'bank_switch') {
+    state.bank = token.name;
+    return;
+  }
+  if (token.type === 'bank_reset') {
+    state.bank = initialState.bank;
+    return;
+  }
+  if (token.type !== 'directive') return;
+
+  if (token.key === 'base' || token.key === 'pitch') {
+    if (token.reset) state.baseF0Hz = initialState.baseF0Hz;
+    else if (token.relative) state.baseF0Hz += token.value;
+    else state.baseF0Hz = token.value;
+    return;
+  }
+
+  const mappedKey = IMPORT_DIRECTIVE_MAP[token.key];
+  if (!mappedKey) return;
+  if (token.reset) state[mappedKey] = initialState[mappedKey];
+  else if (token.relative) state[mappedKey] += token.value;
+  else state[mappedKey] = token.value;
+}
+
+function importTokensToEvents(source, tokens, startingState, initialState) {
+  const events = [];
+  let prefix = [];
+  let pendingState = cloneImportState(startingState);
+  let inGroup = false;
+  let group = [];
+  let groupState = null;
+
+  const flushSingle = (text, token) => {
+    const rawText = [...prefix, text].join(' ').trim();
+    if (!rawText) return;
+    events.push({
+      text: rawText,
+      state: cloneImportState(pendingState),
+      ratioWeight: token.stressed ? 1.5 : 1,
+    });
+    prefix = [];
+  };
+
+  const flushGroup = () => {
+    if (!group.length || !groupState) return;
+    const rawText = [...prefix, '(', ...group, ')'].join(' ').trim();
+    if (rawText) {
+      events.push({
+        text: rawText,
+        state: cloneImportState(groupState),
+        ratioWeight: 1,
+      });
+    }
+    prefix = [];
+    group = [];
+    groupState = null;
+    inGroup = false;
+  };
+
+  for (const token of tokens) {
+    const rawToken = source.slice(token.srcStart, token.srcEnd);
+    if (token.type === 'syllable_open') {
+      inGroup = true;
+      group = [];
+      groupState = cloneImportState(pendingState);
+      continue;
+    }
+    if (token.type === 'syllable_close') {
+      flushGroup();
+      continue;
+    }
+    if (token.type === 'phoneme') {
+      if (inGroup) {
+        group.push(rawToken);
+      } else {
+        flushSingle(rawToken, token);
+      }
+      continue;
+    }
+    if (token.type === 'directive' || token.type === 'bank_switch' || token.type === 'bank_reset') {
+      applyDirectiveToImportState(pendingState, token, initialState);
+      prefix.push(rawToken);
+      continue;
+    }
+    prefix.push(rawToken);
+  }
+
+  if (group.length) flushGroup();
+  return events;
+}
+
+function buildImportedAutomation(project, events, clipState) {
+  const totalWeight = events.reduce((sum, event) => sum + event.ratioWeight, 0) || 1;
+  let traversed = 0;
+  const ratios = events.map((event) => {
+    const ratio = totalWeight <= 1 ? 0 : traversed / Math.max(1, totalWeight - event.ratioWeight);
+    traversed += event.ratioWeight;
+    return ratio;
+  });
+  const automation = {};
+
+  const stateReaders = {
+    pitchOffset: (event) => 12 * Math.log2(Math.max(1e-6, event.state.baseF0Hz) / Math.max(1e-6, project.master.baseF0)),
+    rate: (event) => event.state.rate,
+    scale: (event) => event.state.scale,
+    vibratoDepth: (event) => event.state.vibratoDepth,
+    vibratoRate: (event) => event.state.vibratoRate,
+    tremoloDepth: (event) => event.state.tremoloDepth,
+    tremoloRate: (event) => event.state.tremoloRate,
+    aspiration: (event) => event.state.aspiration,
+    tilt: (event) => event.state.tilt,
+    effort: (event) => event.state.effort,
+  };
+
+  for (const key of AUTOMATION_PARAM_KEYS) {
+    const values = events.map((event) => stateReaders[key](event));
+    const baseValue = key === 'pitchOffset'
+      ? clipState.pitchOffset
+      : key === 'rate'
+        ? clipState.rateMs
+        : (clipState.effects[key] ?? project.master[key]);
+
+    const changed = values.some((value) => Math.abs(value - baseValue) > 0.0001);
+    if (!changed) continue;
+
+    const points = [];
+    for (let index = 0; index < values.length; index += 1) {
+      const value = key === 'pitchOffset'
+        ? clamp(values[index], MIN_PITCH_OFFSET, MAX_PITCH_OFFSET)
+        : clamp(values[index], EFFECT_PARAMS[key].min, EFFECT_PARAMS[key].max);
+      const time = clamp(Number(ratios[index].toFixed(4)), 0, 1);
+      const previous = points[points.length - 1];
+      if (previous && Math.abs(previous.value - value) < 0.0001) {
+        continue;
+      }
+      points.push({
+        id: makeId('kf'),
+        time,
+        value: Number(value.toFixed(4)),
+      });
+    }
+    if (!points.length) continue;
+    if (points[0].time !== 0) {
+      points.unshift({
+        id: makeId('kf'),
+        time: 0,
+        value: Number(baseValue.toFixed(4)),
+      });
+    }
+    automation[key] = points;
+  }
+
+  return automation;
 }
 
 export function splitClip(project, clip, splitIndex) {
@@ -359,53 +633,114 @@ export function splitClip(project, clip, splitIndex) {
 }
 
 export function importProtocol(project, rawCode) {
-  const parsed = tokenize(rawCode);
   const clips = [];
   const beatMs = getBeatMs(project);
-  let currentParts = [];
-  let currentStartBeat = 0;
+  const initialState = getImportInitialState(project);
+  let runningState = cloneImportState(initialState);
   let cursorBeat = 0;
+  let pendingLeadInMs = 0;
 
-  const flush = () => {
-    if (!currentParts.length) return;
-    const phonemes = currentParts.join(' ').trim();
-    const clip = normalizeClip(project, {
+  const flush = (source, currentTokens, currentClipStartState, currentStartBeat, currentLeadInMs) => {
+    if (!currentTokens.length) return false;
+    const phonemeTokens = currentTokens.filter((token) =>
+      token.type === 'phoneme' || token.type === 'syllable_open' || token.type === 'syllable_close'
+    );
+    const rawBody = currentTokens
+      .map((token) => source.slice(token.srcStart, token.srcEnd))
+      .join(' ')
+      .trim();
+    const phonemes = phonemeTokens
+      .map((token) => source.slice(token.srcStart, token.srcEnd))
+      .join(' ')
+      .trim();
+    if (!phonemes) {
+      return false;
+    }
+    const events = importTokensToEvents(source, currentTokens, currentClipStartState, initialState);
+    const firstEventState = events[0]?.state ?? cloneImportState(currentClipStartState);
+    const pitchOffset = clamp(
+      12 * Math.log2(Math.max(1e-6, firstEventState.baseF0Hz) / Math.max(1e-6, project.master.baseF0)),
+      MIN_PITCH_OFFSET,
+      MAX_PITCH_OFFSET,
+    );
+    const clipSeed = {
       id: makeId(),
-      text: phonemes.slice(0, 18),
+      text: protocolToWordLabel(phonemes),
       phonemes,
       startBeat: currentStartBeat,
-      rateMs: project.master.rate,
-      pitchOffset: 0,
+      rateMs: clamp(firstEventState.rate, EFFECT_PARAMS.rate.min, EFFECT_PARAMS.rate.max),
+      pitchOffset,
       color: CLIP_COLORS[clips.length % CLIP_COLORS.length],
-      bank: project.master.bank,
-      effects: {},
+      bank: banks.get(firstEventState.bank) ? firstEventState.bank : project.master.bank,
+      effects: {
+        scale: clamp(firstEventState.scale, EFFECT_PARAMS.scale.min, EFFECT_PARAMS.scale.max),
+        vibratoDepth: clamp(firstEventState.vibratoDepth, EFFECT_PARAMS.vibratoDepth.min, EFFECT_PARAMS.vibratoDepth.max),
+        vibratoRate: clamp(firstEventState.vibratoRate, EFFECT_PARAMS.vibratoRate.min, EFFECT_PARAMS.vibratoRate.max),
+        tremoloDepth: clamp(firstEventState.tremoloDepth, EFFECT_PARAMS.tremoloDepth.min, EFFECT_PARAMS.tremoloDepth.max),
+        tremoloRate: clamp(firstEventState.tremoloRate, EFFECT_PARAMS.tremoloRate.min, EFFECT_PARAMS.tremoloRate.max),
+        aspiration: clamp(firstEventState.aspiration, EFFECT_PARAMS.aspiration.min, EFFECT_PARAMS.aspiration.max),
+        tilt: clamp(firstEventState.tilt, EFFECT_PARAMS.tilt.min, EFFECT_PARAMS.tilt.max),
+        effort: clamp(firstEventState.effort, EFFECT_PARAMS.effort.min, EFFECT_PARAMS.effort.max),
+      },
       automation: {},
-    }, clips.length);
+    };
+    const clip = normalizeClip(project, clipSeed, clips.length);
+    clip.text = protocolToWordLabel(clip.phonemes);
+    clip.automation = buildImportedAutomation(project, events, clip);
+    clip.exactImport = {
+      body: buildStandaloneImportBody(currentClipStartState, rawBody),
+      leadInMs: currentLeadInMs,
+      anchorStartBeat: clip.startBeat,
+      audioSignature: '',
+    };
+    clip.exactImport.audioSignature = getClipAudioSignature(project, clip);
     clips.push(clip);
     cursorBeat = clip.startBeat + clip.lengthBeats;
-    currentParts = [];
+    pendingLeadInMs = 0;
+    return true;
   };
 
-  for (const token of parsed.tokens) {
-    const rawToken = parsed.source.slice(token.srcStart, token.srcEnd);
-    if (token.type === 'pause') {
-      flush();
-      cursorBeat += snapBeat(token.ms / beatMs);
-      currentStartBeat = cursorBeat;
-      continue;
+  for (const rawLine of rawCode.split(/\r?\n/u)) {
+    const parsedLine = tokenize(rawLine);
+    if (!parsedLine.tokens.length) continue;
+    let currentTokens = [];
+    let currentClipStartState = cloneImportState(runningState);
+    let currentStartBeat = cursorBeat;
+    let currentLeadInMs = pendingLeadInMs;
+
+    for (const token of parsedLine.tokens) {
+      if (token.type === 'pause') {
+        flush(parsedLine.source, currentTokens, currentClipStartState, currentStartBeat, currentLeadInMs);
+        currentTokens = [];
+        pendingLeadInMs += token.ms;
+        cursorBeat += snapBeat(token.ms / beatMs);
+        currentStartBeat = cursorBeat;
+        currentClipStartState = cloneImportState(runningState);
+        currentLeadInMs = pendingLeadInMs;
+        continue;
+      }
+      if (token.type === 'directive' && token.key === 'pause') {
+        flush(parsedLine.source, currentTokens, currentClipStartState, currentStartBeat, currentLeadInMs);
+        currentTokens = [];
+        pendingLeadInMs += Math.abs(token.value);
+        cursorBeat += snapBeat(Math.abs(token.value) / beatMs);
+        currentStartBeat = cursorBeat;
+        currentClipStartState = cloneImportState(runningState);
+        currentLeadInMs = pendingLeadInMs;
+        continue;
+      }
+      if (!currentTokens.length) {
+        currentStartBeat = cursorBeat;
+        currentClipStartState = cloneImportState(runningState);
+        currentLeadInMs = pendingLeadInMs;
+      }
+      currentTokens.push(token);
+      if (token.type === 'directive' || token.type === 'bank_switch' || token.type === 'bank_reset') {
+        applyDirectiveToImportState(runningState, token, initialState);
+      }
     }
-    if (token.type === 'directive' && token.key === 'pause') {
-      flush();
-      cursorBeat += snapBeat(Math.abs(token.value) / beatMs);
-      currentStartBeat = cursorBeat;
-      continue;
-    }
-    if (!currentParts.length) {
-      currentStartBeat = cursorBeat;
-    }
-    currentParts.push(rawToken);
+    flush(parsedLine.source, currentTokens, currentClipStartState, currentStartBeat, currentLeadInMs);
   }
-  flush();
 
   project.clips = clips.length ? clips : createProject('HH AH L OW').clips;
   return project;

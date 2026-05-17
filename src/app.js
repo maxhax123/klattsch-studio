@@ -11,6 +11,7 @@ import {
   SONG_EXTENSION,
   SONG_MIME,
   SNAP_BEAT,
+  VOICE_PRESETS,
 } from './constants.js';
 import { sentenceToClips } from './g2p.js';
 import { loadWorkspaceState, saveWorkspaceState } from './db.js';
@@ -31,6 +32,7 @@ import {
   importProtocol,
   importSong,
   normalizeClip,
+  reconstructSentenceFromClips,
   sampleAutomation,
   snapBeat,
   splitClip,
@@ -43,6 +45,7 @@ import { makeId } from './id.js';
 const root = document.getElementById('app');
 const bankNames = banks.list();
 const DEFAULT_PROJECT_TITLE = 'New Session';
+const MOBILE_MEDIA_QUERY = '(max-width: 860px), (pointer: coarse)';
 
 function createWorkspaceProject(project, title = project.master.title || DEFAULT_PROJECT_TITLE) {
   return {
@@ -102,6 +105,7 @@ const state = {
   shellReady: false,
   isLoaded: false,
   persistTimer: null,
+  isMobile: window.matchMedia?.(MOBILE_MEDIA_QUERY)?.matches ?? false,
 };
 state.project = state.workspace.projects[0]?.project ?? createProject();
 
@@ -292,6 +296,16 @@ function getSelectedClips() {
     .filter(Boolean);
 }
 
+function getSelectionStartMs() {
+  const selectedSet = new Set(state.selectedClipIds.length ? state.selectedClipIds : [state.selectedClipId].filter(Boolean));
+  if (!selectedSet.size) return 0;
+  const compiled = audio.compile(state.project);
+  const segment = compiled.playbackSegments
+    .filter((item) => selectedSet.has(item.clipId))
+    .sort((left, right) => left.tStartMs - right.tStartMs)[0];
+  return segment?.tStartMs ?? 0;
+}
+
 function deleteSelectedClip() {
   const clips = getSelectedClips();
   if (!clips.length) return false;
@@ -410,6 +424,147 @@ function shiftImportedClips(clips, offsetBeat) {
   );
 }
 
+function buildImportedSentenceNotice(project) {
+  const reconstructed = reconstructSentenceFromClips(getSortedClips(project));
+  return reconstructed ? ` Reconstructed sentence: "${reconstructed}."` : '';
+}
+
+function getMatchingVoicePresetId(master) {
+  const preset = VOICE_PRESETS.find((item) =>
+    item.bank === master.bank
+    && Math.abs(item.baseF0 - master.baseF0) < 0.0001
+    && Math.abs(item.rate - master.rate) < 0.0001
+    && Math.abs(item.scale - master.scale) < 0.0001
+    && Math.abs(item.vibratoDepth - master.vibratoDepth) < 0.0001
+    && Math.abs(item.vibratoRate - master.vibratoRate) < 0.0001
+    && Math.abs(item.tremoloDepth - master.tremoloDepth) < 0.0001
+    && Math.abs(item.tremoloRate - master.tremoloRate) < 0.0001
+    && Math.abs(item.aspiration - master.aspiration) < 0.0001
+    && Math.abs(item.tilt - master.tilt) < 0.0001
+    && Math.abs(item.effort - master.effort) < 0.0001
+  );
+  return preset?.id ?? 'custom';
+}
+
+function applyVoicePresetToProject(project, presetId) {
+  const preset = VOICE_PRESETS.find((item) => item.id === presetId);
+  if (!preset) return false;
+  const previousMaster = structuredClone(project.master);
+  project.master.bank = preset.bank;
+  project.master.baseF0 = preset.baseF0;
+  project.master.rate = preset.rate;
+  project.master.scale = preset.scale;
+  project.master.vibratoDepth = preset.vibratoDepth;
+  project.master.vibratoRate = preset.vibratoRate;
+  project.master.tremoloDepth = preset.tremoloDepth;
+  project.master.tremoloRate = preset.tremoloRate;
+  project.master.aspiration = preset.aspiration;
+  project.master.tilt = preset.tilt;
+  project.master.effort = preset.effort;
+
+  for (const clip of project.clips) {
+    if (clip.bank === previousMaster.bank) {
+      clip.bank = preset.bank;
+    }
+    if (Math.abs(clip.rateMs - previousMaster.rate) < 0.0001 && !clip.automation.rate?.length) {
+      clip.rateMs = preset.rate;
+      syncClipTiming(project, clip);
+    }
+  }
+  return true;
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+}
+
+function base64UrlToBytes(text) {
+  const padded = `${text}${'='.repeat((4 - (text.length % 4 || 4)) % 4)}`
+    .replaceAll('-', '+')
+    .replaceAll('_', '/');
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function buildShareHash(project) {
+  const payload = exportSong(project);
+  const bytes = new TextEncoder().encode(payload);
+  return `share=${bytesToBase64Url(bytes)}`;
+}
+
+function buildShareUrl(project) {
+  const url = new URL(window.location.href);
+  url.hash = buildShareHash(project);
+  return url.toString();
+}
+
+function parseSharedProjectFromLocation() {
+  const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+  const params = new URLSearchParams(hash);
+  const share = params.get('share');
+  if (!share) return null;
+  try {
+    const json = new TextDecoder().decode(base64UrlToBytes(share));
+    return importSong(json);
+  } catch (error) {
+    reportError('Share link load failed', error);
+    return null;
+  }
+}
+
+function applySharedProjectIfPresent() {
+  const shared = parseSharedProjectFromLocation();
+  if (!shared) return false;
+  const sharedSnapshot = exportSong(shared);
+  const existing = state.workspace.projects.find((entry) => exportSong(entry.project) === sharedSnapshot);
+  if (existing) {
+    state.workspace.activeProjectId = existing.id;
+    state.project = existing.project;
+    setSelection(existing.project.clips[0] ? [existing.project.clips[0].id] : [], existing.project.clips[0]?.id ?? null);
+    return true;
+  }
+  const entry = createWorkspaceProject(shared, shared.master.title || 'Shared Session');
+  state.workspace.projects.push(entry);
+  state.workspace.activeProjectId = entry.id;
+  state.project = entry.project;
+  setSelection(entry.project.clips[0] ? [entry.project.clips[0].id] : [], entry.project.clips[0]?.id ?? null);
+  persist();
+  return true;
+}
+
+async function shareCurrentProject() {
+  const url = buildShareUrl(state.project);
+  if (state.isMobile && navigator.share) {
+    await navigator.share({
+      title: state.project.master.title || 'Klattsch Studio Session',
+      text: 'Klattsch Studio share link',
+      url,
+    });
+    return;
+  }
+  await copyTextToClipboard(url);
+}
+
+function updateResponsiveMode(matches) {
+  state.isMobile = matches;
+  const shell = document.querySelector('.studio-shell');
+  shell?.classList.toggle('mobile-ui', matches);
+}
+
+function installResponsiveModeWatcher() {
+  const media = window.matchMedia?.(MOBILE_MEDIA_QUERY);
+  if (!media) return;
+  updateResponsiveMode(media.matches);
+  media.addEventListener?.('change', (event) => {
+    updateResponsiveMode(event.matches);
+    renderAll();
+  });
+}
+
 function formatRangeValue(key, value) {
   return EFFECT_PARAMS[key].format(value);
 }
@@ -481,7 +636,7 @@ function getTimelineBeatFromMs(currentMs) {
 
 function renderShell() {
   root.innerHTML = `
-    <div class="studio-shell">
+    <div class="studio-shell ${state.isMobile ? 'mobile-ui' : ''}">
       <header class="hero card">
         <div class="hero-copy">
           <p class="eyebrow">Web klattsch sequencer</p>
@@ -638,6 +793,7 @@ function renderShell() {
 }
 
 function renderShellState() {
+  document.querySelector('.studio-shell')?.classList.toggle('mobile-ui', state.isMobile);
   const sectionMappings = [
     ['playlist', '.playlist-card', '.playlist-card > .collapsible-body', '.playlist-tools [data-section="playlist"]'],
     ['keyframes', '.automation-section', '.automation-section > .collapsible-body', '.automation-controls [data-section="keyframes"]'],
@@ -693,6 +849,7 @@ function renderHeader() {
       <div class="transport-row">
         <button type="button" class="ghost-btn" data-action="new-project">New Project</button>
         <button type="button" class="ghost-btn danger" data-action="delete-project">Delete Project</button>
+        <button type="button" class="ghost-btn" data-action="share-project">${state.isMobile && navigator.share ? 'Share Link' : 'Copy Share Link'}</button>
         <button type="button" class="ghost-btn" data-action="export-mp3">Export MP3</button>
         <button type="button" class="ghost-btn" data-action="export-video">Export Video</button>
         <button type="button" class="ghost-btn" data-action="export-song">Save Song</button>
@@ -709,6 +866,7 @@ function renderHeader() {
         <button type="button" class="ghost-btn" data-action="undo" ${history.undo.length ? '' : 'disabled'}>Undo</button>
         <button type="button" class="ghost-btn" data-action="redo" ${history.redo.length ? '' : 'disabled'}>Redo</button>
         <button type="button" class="primary-btn" data-action="play">${state.isPlaying ? 'Playing...' : 'Play Arrangement'}</button>
+        <button type="button" class="ghost-btn" data-action="play-selection" ${state.selectedClipIds.length ? '' : 'disabled'}>Play From Selection</button>
         <button type="button" class="ghost-btn" data-action="stop">Stop</button>
       </div>
     `;
@@ -764,9 +922,14 @@ function renderTimeline() {
 
 function renderMasterSection() {
   const master = state.project.master;
+  const voicePresetId = getMatchingVoicePresetId(master);
   const bankOptions = bankNames
     .map((name) => `<option value="${name}" ${name === master.bank ? 'selected' : ''}>${escapeHtml(name)}</option>`)
     .join('');
+  const voicePresetOptions = [
+    '<option value="custom">Custom Voice</option>',
+    ...VOICE_PRESETS.map((preset) => `<option value="${preset.id}" ${preset.id === voicePresetId ? 'selected' : ''}>${escapeHtml(preset.label)}</option>`),
+  ].join('');
 
   return `
     <section class="stack-block">
@@ -783,6 +946,10 @@ function renderMasterSection() {
           <input id="master-title" type="text" value="${escapeAttr(master.title)}" />
         </label>
         <div class="compact-grid">
+          <label class="field">
+            <span>Voice Preset</span>
+            <select id="master-voice-preset">${voicePresetOptions}</select>
+          </label>
           <label class="field">
             <span>Tempo</span>
             <input id="master-tempo" type="number" min="60" max="220" step="1" value="${master.tempo}" />
@@ -1130,6 +1297,7 @@ async function initializeWorkspace() {
     reportError('Workspace load failed', error);
   }
   syncActiveProjectReference();
+  applySharedProjectIfPresent();
   restoreSelectionForCurrentProject();
   ensureSelection();
   state.isLoaded = true;
@@ -1213,7 +1381,7 @@ function applyModalImport() {
       }
       setSelection(project.clips[0] ? [project.clips[0].id] : [], project.clips[0]?.id ?? null);
     });
-    setStatus('Klattsch code imported into editable clips.', 'success');
+    setStatus(`Klattsch code imported into editable clips.${buildImportedSentenceNotice(state.project)}`, 'success');
   }
 
   closeModal();
@@ -1305,7 +1473,7 @@ function drawAutomationCanvas() {
         { id: 'base-b', time: 1, value: baseValue },
       ];
 
-  context.strokeStyle = '#ff8c42';
+  context.strokeStyle = '#60a5fa';
   context.lineWidth = 2;
   context.beginPath();
   renderPoints.forEach((point, index) => {
@@ -1326,7 +1494,7 @@ function drawAutomationCanvas() {
     context.arc(x, y, 6, 0, Math.PI * 2);
     context.fill();
     context.stroke();
-    context.fillStyle = '#f97316';
+    context.fillStyle = '#38bdf8';
     context.fillRect(x - 1, y - 1, 2, 2);
     context.fillStyle = '#9ca3af';
     context.fillText(formatRangeValue(state.automationParam, liveValue), Math.min(width - 88, x + 10), Math.max(18, y - 10));
@@ -1536,6 +1704,17 @@ function wireShellEvents() {
       }
       return;
     }
+    if (action === 'play-selection') {
+      try {
+        const playback = await audio.play(state.project, { startMs: getSelectionStartMs() });
+        state.playbackSegments = playback.playbackSegments;
+        state.totalMs = playback.result.totalMs;
+        renderTimeline();
+      } catch (error) {
+        reportError('Playback from selection failed', error);
+      }
+      return;
+    }
     if (action === 'toggle-section') {
       const sectionKey = button.dataset.section;
       if (sectionKey && sectionKey in state.collapsedSections) {
@@ -1623,6 +1802,15 @@ function wireShellEvents() {
       }
       return;
     }
+    if (action === 'share-project') {
+      try {
+        await shareCurrentProject();
+        setStatus(state.isMobile && navigator.share ? 'Share sheet opened.' : 'Share link copied.', 'success');
+      } catch (error) {
+        reportError('Share link failed', error);
+      }
+      return;
+    }
     if (action === 'close-modal') {
       closeModal();
       return;
@@ -1687,6 +1875,14 @@ function wireShellEvents() {
       updateProject((project) => {
         project.master.bank = target.value;
       });
+      return;
+    }
+
+    if (target.id === 'master-voice-preset' && target.value !== 'custom') {
+      updateProject((project) => {
+        applyVoicePresetToProject(project, target.value);
+      });
+      setStatus('Voice preset applied.', 'success');
       return;
     }
 
@@ -2008,6 +2204,7 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 renderShell();
+installResponsiveModeWatcher();
 syncActiveProjectReference();
 ensureSelection();
 renderAll();
