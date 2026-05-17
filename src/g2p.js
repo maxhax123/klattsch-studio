@@ -1,4 +1,4 @@
-import { dictionary } from '../node_modules/cmu-pronouncing-dictionary/index.js';
+import { dictionary } from '../vendor/cmu-pronouncing-dictionary.js';
 import {
   CLIP_COLORS,
   DEFAULT_MASTER,

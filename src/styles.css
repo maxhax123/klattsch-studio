@@ -63,6 +63,11 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  cursor: default;
+  opacity: 0.52;
+}
+
 code,
 pre,
 small,
@@ -115,6 +120,30 @@ small,
 
 .hero-copy {
   max-width: 620px;
+}
+
+.project-tabs {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.project-tab {
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 12px;
+  max-width: 180px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.project-tab.active {
+  border-color: rgba(255, 173, 102, 0.88);
+  background: rgba(255, 140, 66, 0.16);
 }
 
 .eyebrow,
@@ -368,6 +397,14 @@ small,
     linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px) 0 0 / 100% 28px;
 }
 
+.selection-marquee {
+  position: absolute;
+  border: 1px solid rgba(56, 189, 248, 0.9);
+  background: rgba(56, 189, 248, 0.14);
+  border-radius: 8px;
+  pointer-events: none;
+}
+
 .clip-shell {
   position: absolute;
   display: grid;
@@ -408,6 +445,10 @@ small,
 
 .clip-shell.selected {
   outline: 2px solid rgba(255, 255, 255, 0.9);
+}
+
+.clip-shell.focused {
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.34), 0 10px 22px rgba(0, 0, 0, 0.28);
 }
 
 .clip-shell.active {

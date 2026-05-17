@@ -313,14 +313,6 @@ export class StudioAudio {
         context2d.fillText(clip.text, x + 8, y + 15);
       }
 
-      const playheadX = timelineX + (playheadBeat / totalBeats) * timelineWidth;
-      context2d.strokeStyle = '#f97316';
-      context2d.lineWidth = 2;
-      context2d.beginPath();
-      context2d.moveTo(playheadX, timelineY - 12);
-      context2d.lineTo(playheadX, timelineY + laneCount * laneHeight + 12);
-      context2d.stroke();
-
       const meterX = 64;
       const meterY = 470;
       const barWidth = 8;

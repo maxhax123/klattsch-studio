@@ -13,6 +13,7 @@ import {
   SNAP_BEAT,
 } from './constants.js';
 import { sentenceToClips } from './g2p.js';
+import { loadWorkspaceState, saveWorkspaceState } from './db.js';
 import { banks } from './engine/banks/index.js';
 import {
   buildProtocol,
@@ -29,23 +30,43 @@ import {
   getSortedClips,
   importProtocol,
   importSong,
-  loadProject,
   normalizeClip,
   sampleAutomation,
-  saveProject,
   snapBeat,
   splitClip,
   syncClipTiming,
   estimateClipUnits,
+  loadProject,
 } from './project.js';
 import { makeId } from './id.js';
 
 const root = document.getElementById('app');
 const bankNames = banks.list();
+const DEFAULT_PROJECT_TITLE = 'New Session';
+
+function createWorkspaceProject(project, title = project.master.title || DEFAULT_PROJECT_TITLE) {
+  return {
+    id: makeId('project'),
+    title,
+    project,
+  };
+}
+
+function createWorkspace() {
+  const seededProject = loadProject() ?? createProject();
+  const entry = createWorkspaceProject(seededProject, seededProject.master.title || 'Demo Session');
+  return {
+    version: 1,
+    activeProjectId: entry.id,
+    projects: [entry],
+  };
+}
 
 const state = {
-  project: loadProject() ?? createProject(),
+  workspace: createWorkspace(),
+  project: null,
   selectedClipId: null,
+  selectedClipIds: [],
   automationParam: 'pitchOffset',
   activeClipId: null,
   playbackSegments: [],
@@ -73,11 +94,16 @@ const state = {
     visible: false,
     x: 0,
     y: 0,
-    clipId: null,
   },
-  clipboardClip: null,
+  clipboardClips: [],
+  histories: {},
+  projectSelections: {},
+  marquee: null,
   shellReady: false,
+  isLoaded: false,
+  persistTimer: null,
 };
+state.project = state.workspace.projects[0]?.project ?? createProject();
 
 const audio = new StudioAudio({
   onStatus(text, kind) {
@@ -94,13 +120,95 @@ const audio = new StudioAudio({
   },
 });
 
+function getActiveProjectEntry() {
+  return state.workspace.projects.find((entry) => entry.id === state.workspace.activeProjectId) ?? null;
+}
+
+function syncActiveProjectReference() {
+  const entry = getActiveProjectEntry() ?? state.workspace.projects[0] ?? null;
+  if (!entry) {
+    const fallback = createWorkspaceProject(createProject());
+    state.workspace.projects = [fallback];
+    state.workspace.activeProjectId = fallback.id;
+    state.project = fallback.project;
+    return fallback;
+  }
+  state.workspace.activeProjectId = entry.id;
+  state.project = entry.project;
+  return entry;
+}
+
+function getCurrentSelectionState() {
+  return {
+    selectedClipId: state.selectedClipId,
+    selectedClipIds: [...state.selectedClipIds],
+  };
+}
+
+function saveSelectionForCurrentProject() {
+  const activeId = state.workspace.activeProjectId;
+  if (!activeId) return;
+  state.projectSelections[activeId] = getCurrentSelectionState();
+}
+
+function restoreSelectionForCurrentProject() {
+  const activeId = state.workspace.activeProjectId;
+  const saved = activeId ? state.projectSelections[activeId] : null;
+  state.selectedClipId = saved?.selectedClipId ?? null;
+  state.selectedClipIds = [...(saved?.selectedClipIds ?? [])];
+}
+
+function makeHistoryEntry() {
+  return {
+    project: copyProject(state.project),
+    selection: getCurrentSelectionState(),
+  };
+}
+
+function getHistory(projectId = state.workspace.activeProjectId) {
+  if (!state.histories[projectId]) {
+    state.histories[projectId] = { undo: [], redo: [] };
+  }
+  return state.histories[projectId];
+}
+
+function schedulePersist() {
+  if (state.persistTimer) {
+    window.clearTimeout(state.persistTimer);
+  }
+  state.persistTimer = window.setTimeout(() => {
+    state.persistTimer = null;
+    const payload = {
+      version: 1,
+      activeProjectId: state.workspace.activeProjectId,
+      projects: state.workspace.projects.map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        project: copyProject(entry.project),
+      })),
+    };
+    saveWorkspaceState(payload).catch((error) => {
+      reportError('IndexedDB save failed', error);
+    });
+  }, 120);
+}
+
 function ensureSelection() {
+  const validIds = new Set(state.project.clips.map((clip) => clip.id));
+  state.selectedClipIds = state.selectedClipIds.filter((id) => validIds.has(id));
+  if (state.selectedClipId && !validIds.has(state.selectedClipId)) {
+    state.selectedClipId = null;
+  }
+  if (!state.selectedClipId && state.selectedClipIds.length) {
+    state.selectedClipId = state.selectedClipIds[0];
+  }
   if (!state.selectedClipId && state.project.clips.length) {
     state.selectedClipId = state.project.clips[0].id;
   }
-  if (state.selectedClipId && !getClipById(state.project, state.selectedClipId)) {
-    state.selectedClipId = state.project.clips[0]?.id ?? null;
+  if (state.selectedClipId && !state.selectedClipIds.includes(state.selectedClipId)) {
+    state.selectedClipIds = [state.selectedClipId];
   }
+  saveSelectionForCurrentProject();
 }
 
 function setStatus(text, kind = 'info') {
@@ -122,7 +230,12 @@ function reportError(label, error) {
 }
 
 function persist() {
-  saveProject(state.project);
+  const active = getActiveProjectEntry();
+  if (active) {
+    active.title = state.project.master.title?.trim() || active.title || DEFAULT_PROJECT_TITLE;
+  }
+  saveSelectionForCurrentProject();
+  schedulePersist();
 }
 
 function sectionClass(sectionKey) {
@@ -135,7 +248,6 @@ function sectionToggleLabel(sectionKey) {
 
 function hideContextMenu() {
   state.contextMenu.visible = false;
-  state.contextMenu.clipId = null;
 }
 
 function isEditableTarget(target) {
@@ -153,70 +265,109 @@ function cloneClipForClipboard(clip) {
   return structuredClone(clip);
 }
 
+function isClipSelected(clipId) {
+  return state.selectedClipIds.includes(clipId);
+}
+
+function setSelection(clipIds, primaryId = clipIds[0] ?? null) {
+  state.selectedClipIds = [...new Set(clipIds)];
+  state.selectedClipId = primaryId && state.selectedClipIds.includes(primaryId)
+    ? primaryId
+    : (state.selectedClipIds[0] ?? null);
+  ensureSelection();
+}
+
+function toggleClipSelection(clipId) {
+  if (isClipSelected(clipId)) {
+    const next = state.selectedClipIds.filter((id) => id !== clipId);
+    setSelection(next, next[0] ?? null);
+    return;
+  }
+  setSelection([...state.selectedClipIds, clipId], clipId);
+}
+
+function getSelectedClips() {
+  return state.selectedClipIds
+    .map((clipId) => getClipById(state.project, clipId))
+    .filter(Boolean);
+}
+
 function deleteSelectedClip() {
-  const clip = getSelectedClip();
-  if (!clip) return false;
-  state.project.clips = state.project.clips.filter((item) => item.id !== clip.id);
-  state.selectedClipId = state.project.clips[0]?.id ?? null;
+  const clips = getSelectedClips();
+  if (!clips.length) return false;
+  const labels = clips.map((clip) => clip.text).join(', ');
+  commitProjectChange((project) => {
+    const selectedSet = new Set(state.selectedClipIds);
+    project.clips = project.clips.filter((item) => !selectedSet.has(item.id));
+    const nextId = project.clips[0]?.id ?? null;
+    setSelection(nextId ? [nextId] : [], nextId);
+  });
   hideContextMenu();
-  persist();
-  renderAll();
-  setStatus('Clip deleted.', 'success');
+  setStatus(`Deleted ${clips.length} clip${clips.length === 1 ? '' : 's'}: ${labels}.`, 'success');
   return true;
 }
 
 function duplicateSelectedClip() {
-  const clip = getSelectedClip();
-  if (!clip) return false;
-  const clone = duplicateClip(state.project, clip);
-  state.selectedClipId = clone.id;
+  const selected = getSelectedClips();
+  if (!selected.length) return false;
+  let clones = [];
+  commitProjectChange((project) => {
+    clones = selected.map((clip) => duplicateClip(project, clip));
+    setSelection(clones.map((clip) => clip.id), clones.at(-1)?.id ?? null);
+  });
   hideContextMenu();
-  persist();
-  renderAll();
-  setStatus(`Duplicated ${clip.text}.`, 'success');
+  setStatus(`Duplicated ${selected.length} clip${selected.length === 1 ? '' : 's'}.`, 'success');
   return true;
 }
 
 function copySelectedClip() {
-  const clip = getSelectedClip();
-  if (!clip) return false;
-  state.clipboardClip = cloneClipForClipboard(clip);
-  setStatus(`Copied ${clip.text}.`, 'success');
+  const clips = getSelectedClips();
+  if (!clips.length) return false;
+  state.clipboardClips = clips
+    .map(cloneClipForClipboard)
+    .sort((left, right) => left.startBeat - right.startBeat || left.pitchOffset - right.pitchOffset);
+  setStatus(`Copied ${clips.length} clip${clips.length === 1 ? '' : 's'}.`, 'success');
   return true;
 }
 
 function pasteClipboardClip() {
-  if (!state.clipboardClip) return false;
-  const base = state.clipboardClip;
-  const pasted = normalizeClip(state.project, {
-    ...structuredClone(base),
-    id: makeId(),
-    text: `${base.text} copy`,
-    startBeat: base.startBeat + base.lengthBeats,
-  }, state.project.clips.length);
-  state.project.clips.push(pasted);
-  state.selectedClipId = pasted.id;
-  persist();
-  renderAll();
-  setStatus(`Pasted ${pasted.text}.`, 'success');
+  if (!state.clipboardClips.length) return false;
+  let pastedIds = [];
+  commitProjectChange((project) => {
+    const baseStartBeat = Math.min(...state.clipboardClips.map((clip) => clip.startBeat));
+    const anchorBeat = getSelectedClip()?.startBeat ?? getProjectEndBeat(project);
+    const offsetBeat = Math.max(SNAP_BEAT, snapBeat(anchorBeat + SNAP_BEAT - baseStartBeat));
+    const pasted = state.clipboardClips.map((base, index) => normalizeClip(project, {
+      ...structuredClone(base),
+      id: makeId(),
+      text: `${base.text} copy`,
+      startBeat: base.startBeat + offsetBeat,
+    }, project.clips.length + index));
+    project.clips.push(...pasted);
+    pastedIds = pasted.map((clip) => clip.id);
+    setSelection(pastedIds, pastedIds.at(-1) ?? null);
+  });
+  setStatus(`Pasted ${pastedIds.length} clip${pastedIds.length === 1 ? '' : 's'}.`, 'success');
   return true;
 }
 
 function nudgeSelectedClip({ beatDelta = 0, pitchDelta = 0 }) {
-  const clip = getSelectedClip();
-  if (!clip) return false;
-  if (beatDelta !== 0) {
-    clip.startBeat = Math.max(0, snapBeat(clip.startBeat + beatDelta));
-  }
-  if (pitchDelta !== 0) {
-    clip.pitchOffset = clamp(
-      clip.pitchOffset + pitchDelta,
-      MIN_PITCH_OFFSET,
-      MAX_PITCH_OFFSET,
-    );
-  }
-  persist();
-  renderAll();
+  const clips = getSelectedClips();
+  if (!clips.length) return false;
+  commitProjectChange(() => {
+    for (const clip of clips) {
+      if (beatDelta !== 0) {
+        clip.startBeat = Math.max(0, snapBeat(clip.startBeat + beatDelta));
+      }
+      if (pitchDelta !== 0) {
+        clip.pitchOffset = clamp(
+          clip.pitchOffset + pitchDelta,
+          MIN_PITCH_OFFSET,
+          MAX_PITCH_OFFSET,
+        );
+      }
+    }
+  });
   return true;
 }
 
@@ -276,7 +427,7 @@ function escapeAttr(text) {
 
 function buildProtocolMarkup() {
   const compiled = buildProtocol(state.project);
-  const selectedId = state.selectedClipId;
+  const selectedIds = new Set(state.selectedClipIds);
   const activeId = state.activeClipId;
   const ranges = [...compiled.ranges].sort((a, b) => a.start - b.start);
   let cursor = 0;
@@ -286,7 +437,7 @@ function buildProtocolMarkup() {
     markup += escapeHtml(compiled.text.slice(cursor, range.start));
     const clipText = escapeHtml(compiled.text.slice(range.start, range.end));
     const classes = ['protocol-segment'];
-    if (range.clipId === selectedId) classes.push('selected');
+    if (selectedIds.has(range.clipId)) classes.push('selected');
     if (range.clipId === activeId) classes.push('active');
     markup += `<span class="${classes.join(' ')}">${clipText}</span>`;
     cursor = range.end;
@@ -338,6 +489,7 @@ function renderShell() {
           <p class="hero-text">
             Playlist words, draw automation, and render like a proper vocal sketchpad.
           </p>
+          <div id="project-tabs" class="project-tabs"></div>
         </div>
         <div class="hero-actions" id="header-actions"></div>
       </header>
@@ -353,7 +505,7 @@ function renderShell() {
               <button type="button" class="ghost-btn" data-action="toggle-section" data-section="playlist">${sectionToggleLabel('playlist')}</button>
               <button type="button" class="ghost-btn" data-action="import-sentence">Import Sentence</button>
               <button type="button" class="ghost-btn" data-action="import-protocol">Import Klattsch Code</button>
-              <button type="button" class="ghost-btn" data-action="new-project">New Demo</button>
+              <button type="button" class="ghost-btn" data-action="new-project">New Project</button>
             </div>
           </div>
           <div class="collapsible-body ${sectionClass('playlist')}">
@@ -409,6 +561,7 @@ function renderShell() {
             </div>
             <div class="playlist-tools">
               <button type="button" class="ghost-btn" data-action="toggle-section" data-section="protocol">${sectionToggleLabel('protocol')}</button>
+              <button type="button" class="ghost-btn" data-action="copy-protocol">Copy Code</button>
               <button type="button" class="ghost-btn" data-action="export-protocol">Download Code</button>
             </div>
           </div>
@@ -435,8 +588,8 @@ function renderShell() {
         class="context-menu ${state.contextMenu.visible ? '' : 'hidden'}"
         style="left:${state.contextMenu.x}px;top:${state.contextMenu.y}px"
       >
-        <button type="button" class="context-item" data-action="duplicate-clip">Duplicate Clip</button>
-        <button type="button" class="context-item danger" data-action="delete-clip">Delete Clip</button>
+        <button type="button" class="context-item" data-action="duplicate-clip">Duplicate Selection</button>
+        <button type="button" class="context-item danger" data-action="delete-clip">Delete Selection</button>
       </div>
 
       <div class="modal-backdrop hidden" id="modal-backdrop">
@@ -483,6 +636,8 @@ function renderShellState() {
   const sectionMappings = [
     ['playlist', '.playlist-card', '.playlist-card > .collapsible-body', '.playlist-tools [data-section="playlist"]'],
     ['keyframes', '.automation-section', '.automation-section > .collapsible-body', '.automation-controls [data-section="keyframes"]'],
+    ['masterVoice', '.stack-block:has([data-section="masterVoice"])', '.stack-block:has([data-section="masterVoice"]) > .collapsible-body', '[data-section="masterVoice"]'],
+    ['clipInspector', '.stack-block:has([data-section="clipInspector"])', '.stack-block:has([data-section="clipInspector"]) > .collapsible-body', '[data-section="clipInspector"]'],
     ['protocol', '.protocol-card', '.protocol-card > .collapsible-body', '.protocol-card [data-section="protocol"]'],
     ['status', '.footer-card', '.footer-card > .collapsible-body', '.footer-card [data-section="status"]'],
   ];
@@ -513,20 +668,37 @@ function renderShellState() {
 function renderHeader() {
   const selected = getSelectedClip();
   const actions = document.getElementById('header-actions');
+  const projectTabs = document.getElementById('project-tabs');
+  const activeProjectId = state.workspace.activeProjectId;
+  const history = getHistory();
+  projectTabs.innerHTML = state.workspace.projects.map((entry) => `
+    <button
+      type="button"
+      class="project-tab ${entry.id === activeProjectId ? 'active' : ''}"
+      data-action="switch-project"
+      data-project-id="${entry.id}"
+      title="${escapeAttr(entry.title)}"
+    >
+      ${escapeHtml(entry.title || DEFAULT_PROJECT_TITLE)}
+    </button>
+  `).join('');
   actions.innerHTML = `
     <div class="transport-stack">
       <div class="transport-row">
+        <button type="button" class="ghost-btn" data-action="undo" ${history.undo.length ? '' : 'disabled'}>Undo</button>
+        <button type="button" class="ghost-btn" data-action="redo" ${history.redo.length ? '' : 'disabled'}>Redo</button>
         <button type="button" class="primary-btn" data-action="play">${state.isPlaying ? 'Playing...' : 'Play Arrangement'}</button>
         <button type="button" class="ghost-btn" data-action="stop">Stop</button>
       </div>
       <div class="transport-row">
+        <button type="button" class="ghost-btn" data-action="new-project">New Project</button>
         <button type="button" class="ghost-btn" data-action="export-mp3">Export MP3</button>
         <button type="button" class="ghost-btn" data-action="export-video">Export Video</button>
         <button type="button" class="ghost-btn" data-action="export-song">Save Song</button>
       </div>
       <div class="transport-meta ${state.statusKind}">
         <span>${escapeHtml(state.statusText)}</span>
-        <small>${selected ? `Selected: ${escapeHtml(selected.text)} (${selected.pitchOffset > 0 ? '+' : ''}${selected.pitchOffset} st)` : 'No clip selected'}</small>
+        <small>${selected ? `Selected: ${state.selectedClipIds.length} clip${state.selectedClipIds.length === 1 ? '' : 's'} | focus ${escapeHtml(selected.text)} (${selected.pitchOffset > 0 ? '+' : ''}${selected.pitchOffset} st)` : 'No clip selected'}</small>
       </div>
     </div>
   `;
@@ -549,14 +721,15 @@ function renderTimeline() {
   grid.innerHTML = `
     ${getSortedClips(state.project).map((clip) => {
       const laneIndex = MAX_PITCH_OFFSET - clip.pitchOffset;
-      const selected = clip.id === state.selectedClipId;
+      const selected = isClipSelected(clip.id);
+      const focused = clip.id === state.selectedClipId;
       const active = clip.id === state.activeClipId;
       const top = laneIndex * ROW_HEIGHT + 4;
       const left = clip.startBeat * PIXELS_PER_BEAT + 4;
       const width = Math.max(68, clip.lengthBeats * PIXELS_PER_BEAT - 8);
       return `
         <article
-          class="clip-shell ${selected ? 'selected' : ''} ${active ? 'active' : ''}"
+          class="clip-shell ${selected ? 'selected' : ''} ${focused ? 'focused' : ''} ${active ? 'active' : ''}"
           data-clip-id="${clip.id}"
           data-color="${clip.color}"
           style="top:${top}px;left:${left}px;width:${width}px"
@@ -569,6 +742,12 @@ function renderTimeline() {
         </article>
       `;
     }).join('')}
+    ${state.marquee ? `
+      <div
+        class="selection-marquee"
+        style="left:${state.marquee.left}px;top:${state.marquee.top}px;width:${state.marquee.width}px;height:${state.marquee.height}px"
+      ></div>
+    ` : ''}
   `;
 }
 
@@ -749,10 +928,11 @@ function renderFooter() {
     </div>
     <div class="footer-note">
       <p class="status-pill ${state.statusKind}">${escapeHtml(state.statusText)}</p>
-      <p>${selected ? `Selected clip: ${escapeHtml(selected.text)} using ${escapeHtml(selected.bank)}.` : 'Select a clip to inspect its voice settings and automation.'}</p>
+      <p>${selected ? `Selected ${state.selectedClipIds.length} clip${state.selectedClipIds.length === 1 ? '' : 's'} with ${escapeHtml(selected.text)} in focus using ${escapeHtml(selected.bank)}.` : 'Select a clip to inspect its voice settings and automation.'}</p>
       <ul class="tips-list">
         <li>Double-click the playlist to create a new clip at that beat and pitch lane.</li>
         <li>Drag clips vertically to transpose them. That movement rewrites pitch via generated <code>b</code> directives.</li>
+        <li>Drag empty space to marquee-select multiple clips, then move or delete them together.</li>
         <li>Use the automation lane to add keyframes for pitch, rate, vibrato, tremolo, aspiration, tilt, and effort.</li>
       </ul>
     </div>
@@ -778,7 +958,39 @@ function renderModal() {
   replace.checked = state.modal.replace;
 }
 
+function captureActiveFieldState() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) return null;
+  if (!root.contains(active)) return null;
+  if (!active.id) return null;
+  if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) return null;
+  return {
+    id: active.id,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd,
+    scrollTop: active.scrollTop,
+    scrollLeft: active.scrollLeft,
+  };
+}
+
+function restoreActiveFieldState(snapshot) {
+  if (!snapshot) return;
+  const next = document.getElementById(snapshot.id);
+  if (!(next instanceof HTMLInputElement || next instanceof HTMLTextAreaElement)) return;
+  next.focus({ preventScroll: true });
+  if (typeof snapshot.selectionStart === 'number' && typeof snapshot.selectionEnd === 'number') {
+    try {
+      next.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+    } catch (_error) {
+      // Some input types do not support explicit selection ranges.
+    }
+  }
+  next.scrollTop = snapshot.scrollTop;
+  next.scrollLeft = snapshot.scrollLeft;
+}
+
 function renderAll() {
+  const activeField = captureActiveFieldState();
   if (!state.shellReady) renderShell();
   ensureSelection();
   renderShellState();
@@ -789,12 +1001,99 @@ function renderAll() {
   renderFooter();
   renderModal();
   drawAutomationCanvas();
+  restoreActiveFieldState(activeField);
+}
+
+function commitProjectChange(mutator, options = {}) {
+  const { skipHistory = false } = options;
+  if (!skipHistory) {
+    const history = getHistory();
+    history.undo.push(makeHistoryEntry());
+    if (history.undo.length > 120) history.undo.shift();
+    history.redo = [];
+  }
+  ensureSelection();
+  mutator(state.project);
+  persist();
+  renderAll();
 }
 
 function updateProject(mutator) {
-  mutator(state.project);
-  ensureSelection();
+  commitProjectChange(mutator);
+}
+
+function restoreHistoryEntry(entry) {
+  const active = getActiveProjectEntry();
+  if (!active || !entry) return false;
+  active.project = copyProject(entry.project);
+  state.project = active.project;
+  state.selectedClipId = entry.selection.selectedClipId;
+  state.selectedClipIds = [...entry.selection.selectedClipIds];
   persist();
+  renderAll();
+  return true;
+}
+
+function undoProjectChange() {
+  const history = getHistory();
+  const entry = history.undo.pop();
+  if (!entry) return false;
+  history.redo.push(makeHistoryEntry());
+  return restoreHistoryEntry(entry);
+}
+
+function redoProjectChange() {
+  const history = getHistory();
+  const entry = history.redo.pop();
+  if (!entry) return false;
+  history.undo.push(makeHistoryEntry());
+  return restoreHistoryEntry(entry);
+}
+
+function createAdditionalProject(seedProject = createProject()) {
+  saveSelectionForCurrentProject();
+  const entry = createWorkspaceProject(seedProject, seedProject.master.title || `Session ${state.workspace.projects.length + 1}`);
+  state.workspace.projects.push(entry);
+  state.workspace.activeProjectId = entry.id;
+  state.project = entry.project;
+  setSelection(entry.project.clips[0] ? [entry.project.clips[0].id] : [], entry.project.clips[0]?.id ?? null);
+  persist();
+  renderAll();
+}
+
+function switchProject(projectId) {
+  if (projectId === state.workspace.activeProjectId) return;
+  saveSelectionForCurrentProject();
+  state.workspace.activeProjectId = projectId;
+  syncActiveProjectReference();
+  restoreSelectionForCurrentProject();
+  ensureSelection();
+  hideContextMenu();
+  audio.stop();
+  renderAll();
+}
+
+async function initializeWorkspace() {
+  try {
+    const saved = await loadWorkspaceState();
+    if (saved?.projects?.length) {
+      state.workspace = {
+        version: 1,
+        activeProjectId: saved.activeProjectId,
+        projects: saved.projects.map((entry) => ({
+          id: entry.id ?? makeId('project'),
+          title: entry.title || entry.project?.master?.title || DEFAULT_PROJECT_TITLE,
+          project: importSong(JSON.stringify(entry.project)),
+        })),
+      };
+    }
+  } catch (error) {
+    reportError('Workspace load failed', error);
+  }
+  syncActiveProjectReference();
+  restoreSelectionForCurrentProject();
+  ensureSelection();
+  state.isLoaded = true;
   renderAll();
 }
 
@@ -808,6 +1107,25 @@ function downloadText(text, name, type = 'text/plain') {
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const ok = document.execCommand('copy');
+  textarea.remove();
+  if (!ok) {
+    throw new Error('Clipboard copy is not available in this browser.');
+  }
 }
 
 function openModal(mode) {
@@ -842,7 +1160,7 @@ function applyModalImport() {
       } else {
         project.clips.push(...shiftImportedClips(imported, getProjectEndBeat(project)));
       }
-      state.selectedClipId = project.clips[0]?.id ?? null;
+      setSelection(project.clips[0] ? [project.clips[0].id] : [], project.clips[0]?.id ?? null);
     });
     setStatus('Sentence imported and converted into valid klattsch protocol.', 'success');
   } else if (state.modal.mode === 'protocol') {
@@ -854,7 +1172,7 @@ function applyModalImport() {
         importProtocol(temp, state.modal.value);
         project.clips.push(...shiftImportedClips(temp.clips, getProjectEndBeat(project)));
       }
-      state.selectedClipId = project.clips[0]?.id ?? null;
+      setSelection(project.clips[0] ? [project.clips[0].id] : [], project.clips[0]?.id ?? null);
     });
     setStatus('Klattsch code imported into editable clips.', 'success');
   }
@@ -1005,22 +1323,23 @@ function handleAutomationPointerDown(event) {
   const points = clip.automation[state.automationParam] ?? [];
 
   if (event.altKey && hit.point) {
-    clip.automation[state.automationParam] = points.filter((point) => point.id !== hit.point.id);
-    persist();
-    renderAll();
+    commitProjectChange(() => {
+      clip.automation[state.automationParam] = points.filter((point) => point.id !== hit.point.id);
+    });
     return;
   }
 
   if (hit.point) {
-    state.automationDrag = { pointId: hit.point.id };
+    state.automationDrag = { pointId: hit.point.id, historyEntry: makeHistoryEntry(), didChange: false };
   } else {
+    const historyEntry = makeHistoryEntry();
     const nextPoint = {
       id: makeId('kf'),
       time: Number(automationXToTime(hit.x, hit.width, hit.padding).toFixed(4)),
       value: automationYToValue(state.automationParam, hit.y, hit.height, hit.padding),
     };
     clip.automation[state.automationParam] = [...points, nextPoint].sort((left, right) => left.time - right.time);
-    state.automationDrag = { pointId: nextPoint.id };
+    state.automationDrag = { pointId: nextPoint.id, historyEntry, didChange: true };
     persist();
     renderAll();
   }
@@ -1043,11 +1362,18 @@ function handleAutomationPointerMove(event) {
   point.time = Number(automationXToTime(event.clientX - rect.left, rect.width, padding).toFixed(4));
   point.value = automationYToValue(state.automationParam, event.clientY - rect.top, rect.height, padding);
   clip.automation[state.automationParam] = points.sort((left, right) => left.time - right.time);
+  state.automationDrag.didChange = true;
   drawAutomationCanvas();
 }
 
 function handleAutomationPointerUp(event) {
   if (!state.automationDrag) return;
+  if (state.automationDrag.didChange) {
+    const history = getHistory();
+    history.undo.push(state.automationDrag.historyEntry);
+    if (history.undo.length > 120) history.undo.shift();
+    history.redo = [];
+  }
   state.automationDrag = null;
   const canvas = getAutomationCanvas();
   canvas.releasePointerCapture(event.pointerId);
@@ -1063,16 +1389,94 @@ function handleSongFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
   file.text().then((text) => {
-    state.project = importSong(text);
-    state.selectedClipId = state.project.clips[0]?.id ?? null;
-    persist();
-    renderAll();
+    commitProjectChange((project) => {
+      const imported = importSong(text);
+      project.master = imported.master;
+      project.clips = imported.clips;
+      setSelection(project.clips[0] ? [project.clips[0].id] : [], project.clips[0]?.id ?? null);
+    });
     setStatus('Song imported.', 'success');
   }).catch((error) => {
     reportError('Song import failed', error);
   }).finally(() => {
     event.target.value = '';
   });
+}
+
+function getTimelineSelectionRect(startX, startY, currentX, currentY) {
+  return {
+    left: Math.min(startX, currentX),
+    top: Math.min(startY, currentY),
+    width: Math.abs(currentX - startX),
+    height: Math.abs(currentY - startY),
+  };
+}
+
+function getClipScreenRect(clip) {
+  const laneIndex = MAX_PITCH_OFFSET - clip.pitchOffset;
+  return {
+    left: clip.startBeat * PIXELS_PER_BEAT + 4,
+    top: laneIndex * ROW_HEIGHT + 4,
+    right: clip.startBeat * PIXELS_PER_BEAT + Math.max(68, clip.lengthBeats * PIXELS_PER_BEAT - 8) + 4,
+    bottom: laneIndex * ROW_HEIGHT + ROW_HEIGHT,
+  };
+}
+
+function marqueeSelect(rect, additive) {
+  const selectedIds = getSortedClips(state.project)
+    .filter((clip) => {
+      const bounds = getClipScreenRect(clip);
+      return (
+        bounds.left < rect.left + rect.width &&
+        bounds.right > rect.left &&
+        bounds.top < rect.top + rect.height &&
+        bounds.bottom > rect.top
+      );
+    })
+    .map((clip) => clip.id);
+  const merged = additive ? [...state.selectedClipIds, ...selectedIds] : selectedIds;
+  setSelection(merged, selectedIds.at(-1) ?? merged[0] ?? null);
+}
+
+function beginClipDrag(event, clip, mode) {
+  const selectedIds = mode === 'move'
+    ? (isClipSelected(clip.id) ? [...state.selectedClipIds] : [clip.id])
+    : [clip.id];
+  setSelection(selectedIds, clip.id);
+  state.drag = {
+    mode,
+    startX: event.clientX,
+    startY: event.clientY,
+    clipIds: [...selectedIds],
+    historyEntry: makeHistoryEntry(),
+    didChange: false,
+    snapshots: selectedIds.map((clipId) => {
+      const item = getClipById(state.project, clipId);
+      return {
+        clipId,
+        startBeat: item.startBeat,
+        lengthBeats: item.lengthBeats,
+        pitchOffset: item.pitchOffset,
+      };
+    }),
+  };
+  window.addEventListener('pointermove', handleTimelinePointerMove);
+  window.addEventListener('pointerup', handleTimelinePointerUp, { once: true });
+}
+
+function beginMarquee(event, timeline) {
+  const rect = timeline.getBoundingClientRect();
+  state.marquee = {
+    additive: event.shiftKey || event.ctrlKey || event.metaKey,
+    anchorX: event.clientX - rect.left,
+    anchorY: event.clientY - rect.top,
+    left: event.clientX - rect.left,
+    top: event.clientY - rect.top,
+    width: 0,
+    height: 0,
+  };
+  window.addEventListener('pointermove', handleTimelinePointerMove);
+  window.addEventListener('pointerup', handleTimelinePointerUp, { once: true });
 }
 
 function wireShellEvents() {
@@ -1098,6 +1502,22 @@ function wireShellEvents() {
       if (sectionKey && sectionKey in state.collapsedSections) {
         state.collapsedSections[sectionKey] = !state.collapsedSections[sectionKey];
         renderAll();
+      }
+      return;
+    }
+    if (action === 'switch-project') {
+      switchProject(button.dataset.projectId);
+      return;
+    }
+    if (action === 'undo') {
+      if (undoProjectChange()) {
+        setStatus('Undid last change.', 'success');
+      }
+      return;
+    }
+    if (action === 'redo') {
+      if (redoProjectChange()) {
+        setStatus('Redid change.', 'success');
       }
       return;
     }
@@ -1133,6 +1553,15 @@ function wireShellEvents() {
       setStatus('Protocol exported.', 'success');
       return;
     }
+    if (action === 'copy-protocol') {
+      try {
+        await copyTextToClipboard(buildProtocol(state.project).text);
+        setStatus('Protocol copied to clipboard.', 'success');
+      } catch (error) {
+        reportError('Clipboard copy failed', error);
+      }
+      return;
+    }
     if (action === 'import-sentence') {
       openModal('sentence');
       return;
@@ -1142,11 +1571,8 @@ function wireShellEvents() {
       return;
     }
     if (action === 'new-project') {
-      state.project = createProject();
-      state.selectedClipId = state.project.clips[0]?.id ?? null;
-      persist();
-      renderAll();
-      setStatus('Loaded a fresh demo arrangement.', 'success');
+      createAdditionalProject(createProject());
+      setStatus('Opened a fresh project tab.', 'success');
       return;
     }
     if (action === 'close-modal') {
@@ -1162,9 +1588,9 @@ function wireShellEvents() {
       return;
     }
     if (action === 'clear-automation' && clip) {
-      delete clip.automation[state.automationParam];
-      persist();
-      renderAll();
+      commitProjectChange(() => {
+        delete clip.automation[state.automationParam];
+      });
       setStatus(`Cleared ${EFFECT_PARAMS[state.automationParam].label} automation.`, 'success');
       return;
     }
@@ -1175,14 +1601,17 @@ function wireShellEvents() {
     if (action === 'split-clip' && clip) {
       const splitInput = document.getElementById('clip-split-index');
       const splitIndex = Number(splitInput.value);
-      const result = splitClip(state.project, clip, splitIndex);
+      let result = null;
+      commitProjectChange(() => {
+        result = splitClip(state.project, clip, splitIndex);
+        if (result) {
+          setSelection([result.id], result.id);
+        }
+      });
       if (!result) {
         setStatus('This clip needs at least two phoneme tokens before it can split.', 'warn');
         return;
       }
-      state.selectedClipId = result.id;
-      persist();
-      renderAll();
       setStatus('Clip split into two editable words.', 'success');
       return;
     }
@@ -1315,8 +1744,18 @@ function wireShellEvents() {
   timeline.addEventListener('click', (event) => {
     hideContextMenu();
     const clipEl = event.target.closest('.clip-shell');
-    if (!clipEl) return;
-    state.selectedClipId = clipEl.dataset.clipId;
+    if (!clipEl) {
+      if (!event.shiftKey && !event.ctrlKey && !event.metaKey) {
+        setSelection([], null);
+        renderAll();
+      }
+      return;
+    }
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+      toggleClipSelection(clipEl.dataset.clipId);
+    } else {
+      setSelection([clipEl.dataset.clipId], clipEl.dataset.clipId);
+    }
     renderAll();
   });
 
@@ -1328,32 +1767,27 @@ function wireShellEvents() {
     const beat = Math.max(0, snapBeat(x / PIXELS_PER_BEAT));
     const lane = Math.round(y / ROW_HEIGHT);
     const pitchOffset = clamp(MAX_PITCH_OFFSET - lane, MIN_PITCH_OFFSET, MAX_PITCH_OFFSET);
-    const clip = createBlankClip(state.project, beat, pitchOffset);
-    state.selectedClipId = clip.id;
-    persist();
-    renderAll();
+    let clipId = null;
+    commitProjectChange((project) => {
+      const clip = createBlankClip(project, beat, pitchOffset);
+      clipId = clip.id;
+      setSelection([clip.id], clip.id);
+    });
     setStatus('New clip added to the playlist.', 'success');
   });
 
   timeline.addEventListener('pointerdown', (event) => {
     hideContextMenu();
     const clipEl = event.target.closest('.clip-shell');
-    if (!clipEl) return;
+    if (!clipEl) {
+      beginMarquee(event, timeline);
+      renderTimeline();
+      return;
+    }
     const clip = getClipById(state.project, clipEl.dataset.clipId);
     if (!clip) return;
     const mode = event.target.dataset.resize ? `resize-${event.target.dataset.resize}` : 'move';
-    state.selectedClipId = clip.id;
-    state.drag = {
-      clipId: clip.id,
-      mode,
-      startX: event.clientX,
-      startY: event.clientY,
-      originalStartBeat: clip.startBeat,
-      originalLength: clip.lengthBeats,
-      originalPitch: clip.pitchOffset,
-    };
-    window.addEventListener('pointermove', handleTimelinePointerMove);
-    window.addEventListener('pointerup', handleTimelinePointerUp, { once: true });
+    beginClipDrag(event, clip, mode);
     renderAll();
   });
 
@@ -1361,11 +1795,12 @@ function wireShellEvents() {
     const clipEl = event.target.closest('.clip-shell');
     if (!clipEl) return;
     event.preventDefault();
-    state.selectedClipId = clipEl.dataset.clipId;
+    if (!isClipSelected(clipEl.dataset.clipId)) {
+      setSelection([clipEl.dataset.clipId], clipEl.dataset.clipId);
+    }
     state.contextMenu.visible = true;
     state.contextMenu.x = event.clientX;
     state.contextMenu.y = event.clientY;
-    state.contextMenu.clipId = clipEl.dataset.clipId;
     renderAll();
   });
 
@@ -1393,6 +1828,14 @@ function handleGlobalKeyDown(event) {
   if (isEditableTarget(event.target)) return;
 
   const modKey = event.ctrlKey || event.metaKey;
+  if (modKey && event.key.toLowerCase() === 'z' && !event.shiftKey) {
+    if (undoProjectChange()) event.preventDefault();
+    return;
+  }
+  if (modKey && ((event.key.toLowerCase() === 'z' && event.shiftKey) || event.key.toLowerCase() === 'y')) {
+    if (redoProjectChange()) event.preventDefault();
+    return;
+  }
   if (modKey && event.key.toLowerCase() === 'c') {
     if (copySelectedClip()) event.preventDefault();
     return;
@@ -1425,37 +1868,84 @@ function handleGlobalKeyDown(event) {
 }
 
 function handleTimelinePointerMove(event) {
+  if (state.marquee) {
+    const timeline = document.getElementById('timeline-grid');
+    const rect = timeline.getBoundingClientRect();
+    const currentX = clamp(event.clientX - rect.left, 0, rect.width);
+    const currentY = clamp(event.clientY - rect.top, 0, rect.height);
+    Object.assign(
+      state.marquee,
+      getTimelineSelectionRect(state.marquee.anchorX, state.marquee.anchorY, currentX, currentY),
+    );
+    marqueeSelect(state.marquee, state.marquee.additive);
+    renderTimeline();
+    renderHeader();
+    renderFooter();
+    return;
+  }
+
   if (!state.drag) return;
-  const clip = getClipById(state.project, state.drag.clipId);
-  if (!clip) return;
   const deltaBeat = snapBeat((event.clientX - state.drag.startX) / PIXELS_PER_BEAT);
   const pitchDelta = Math.round((event.clientY - state.drag.startY) / ROW_HEIGHT);
+  const clips = state.drag.snapshots
+    .map((snapshot) => ({
+      snapshot,
+      clip: getClipById(state.project, snapshot.clipId),
+    }))
+    .filter((entry) => entry.clip);
 
   if (state.drag.mode === 'move') {
-    clip.startBeat = Math.max(0, snapBeat(state.drag.originalStartBeat + deltaBeat));
-    clip.pitchOffset = clamp(state.drag.originalPitch - pitchDelta, MIN_PITCH_OFFSET, MAX_PITCH_OFFSET);
+    const minStartBeat = Math.min(...clips.map((entry) => entry.snapshot.startBeat));
+    const boundedBeatDelta = Math.max(-minStartBeat, deltaBeat);
+    for (const { snapshot, clip } of clips) {
+      clip.startBeat = Math.max(0, snapBeat(snapshot.startBeat + boundedBeatDelta));
+      clip.pitchOffset = clamp(snapshot.pitchOffset - pitchDelta, MIN_PITCH_OFFSET, MAX_PITCH_OFFSET);
+    }
+    state.drag.didChange = true;
   }
 
   if (state.drag.mode === 'resize-left') {
-    const originalEnd = state.drag.originalStartBeat + state.drag.originalLength;
-    clip.startBeat = Math.max(0, snapBeat(state.drag.originalStartBeat + deltaBeat));
-    clip.startBeat = Math.min(clip.startBeat, originalEnd - 0.5);
-    clip.lengthBeats = Math.max(0.5, snapBeat(originalEnd - clip.startBeat));
-    syncClipRateFromLength(clip);
+    const { snapshot, clip } = clips[0] ?? {};
+    if (clip && snapshot) {
+      const originalEnd = snapshot.startBeat + snapshot.lengthBeats;
+      clip.startBeat = Math.max(0, snapBeat(snapshot.startBeat + deltaBeat));
+      clip.startBeat = Math.min(clip.startBeat, originalEnd - 0.5);
+      clip.lengthBeats = Math.max(0.5, snapBeat(originalEnd - clip.startBeat));
+      syncClipRateFromLength(clip);
+      state.drag.didChange = true;
+    }
   }
 
   if (state.drag.mode === 'resize-right') {
-    clip.lengthBeats = Math.max(0.5, snapBeat(state.drag.originalLength + deltaBeat));
-    syncClipRateFromLength(clip);
+    const { snapshot, clip } = clips[0] ?? {};
+    if (clip && snapshot) {
+      clip.lengthBeats = Math.max(0.5, snapBeat(snapshot.lengthBeats + deltaBeat));
+      syncClipRateFromLength(clip);
+      state.drag.didChange = true;
+    }
   }
 
   renderTimeline();
   renderInspector();
   renderProtocolPanel();
+  renderFooter();
 }
 
 function handleTimelinePointerUp() {
   window.removeEventListener('pointermove', handleTimelinePointerMove);
+  if (state.marquee) {
+    state.marquee = null;
+    renderAll();
+    return;
+  }
+  if (state.drag) {
+    if (state.drag.didChange) {
+      const history = getHistory();
+      history.undo.push(state.drag.historyEntry);
+      if (history.undo.length > 120) history.undo.shift();
+      history.redo = [];
+    }
+  }
   state.drag = null;
   persist();
   renderAll();
@@ -1470,5 +1960,7 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 renderShell();
+syncActiveProjectReference();
 ensureSelection();
 renderAll();
+initializeWorkspace();
